@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
+const { Octokit } = require('@octokit/rest');
 
 // 設定値（環境変数から読み込み）
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -8,6 +9,13 @@ const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 const TRELLO_BOARD_ID = process.env.TRELLO_BOARD_ID;
 const TRELLO_LIST_ID = process.env.TRELLO_LIST_ID;
+// GitHub設定
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_OWNER = 'Mahoroba-Organization';
+const GITHUB_REPO_DEFAULT = 'mahoroba-planning';
+const GITHUB_REPO_FRONT = 'mahoroba-ios';
+const GITHUB_REPO_BACK = 'mahoroba-api';
+const GITHUB_REPO_WEB = 'mahoroba-web';
 
 // Trelloリスト定義
 const LISTS = {
@@ -21,6 +29,11 @@ const LISTS = {
 
 // デフォルトリスト（今回改修）
 const DEFAULT_LIST_ID = '687cf40ce6cf47d1cd9f7ea7';
+
+// GitHub API初期化
+const github = new Octokit({
+  auth: GITHUB_TOKEN
+});
 
 // キャッシュクラス
 class TaskCache {
@@ -166,9 +179,66 @@ class TrelloAPI {
     }
 }
 
+// GitHub API関数
+class GitHubAPI {
+    static async createPlanningIssue(trelloCard) {
+        try {
+            const issue = await github.rest.issues.create({
+                owner: GITHUB_OWNER,
+                repo: GITHUB_REPO_DEFAULT,
+                title: trelloCard.name,
+                body: `## 📋 要件概要
+${trelloCard.desc || ''}
+
+## 🔍 実装検討
+- [ ] 影響範囲の調査
+- [ ] 技術仕様の決定
+- [ ] 作業分担の決定
+- [ ] 実装方針の確定
+
+## 🔗 関連リソース
+- **Trello Card**: ${trelloCard.shortUrl}
+
+---
+**Planning Issue**: 要件管理用Issue`,
+                labels: ['requirements', 'planning']
+            });
+            
+            return issue.data;
+        } catch (error) {
+            console.error('GitHub Planning Issue作成エラー:', error);
+            throw error;
+        }
+    }
+}
+
 // スラッシュコマンドの定義
 const commands = [
     // 基本コマンド
+    new SlashCommandBuilder()
+        .setName('add-task')
+        .setDescription('指定したリストに新しいタスクを追加します')
+        .addStringOption(option =>
+            option.setName('list')
+                .setDescription('追加先のリスト')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'アイデア', value: 'アイデア' },
+                    { name: '決定要件', value: '決定要件' },
+                    { name: '今回改修', value: '今回改修' },
+                    { name: '作業中', value: '作業中' },
+                    { name: 'リリース待ち', value: 'リリース待ち' },
+                    { name: 'リリース済', value: 'リリース済' }
+                ))
+        .addStringOption(option =>
+            option.setName('title')
+                .setDescription('タスクのタイトル')
+                .setRequired(true))
+        .addStringOption(option =>
+            option.setName('description')
+                .setDescription('タスクの詳細説明')
+                .setRequired(false)),
+
     new SlashCommandBuilder()
         .setName('list-tasks')
         .setDescription('Trelloのタスク一覧を表示します')
@@ -339,6 +409,39 @@ async function handleAutocomplete(interaction) {
     }
 }
 
+// タスク追加の処理
+async function handleAddTask(interaction, options) {
+    await interaction.deferReply();
+    
+    const listName = options.getString('list');
+    const title = options.getString('title');
+    const description = options.getString('description') || '';
+    
+    const listId = LISTS[listName];
+    if (!listId) {
+        await interaction.editReply('指定されたリストが見つかりません。');
+        return;
+    }
+    
+    const card = await TrelloAPI.createCard(title, description, listId);
+    
+    // タスクが追加されたのでキャッシュをクリア
+    taskCache.clear();
+    
+    const embed = new EmbedBuilder()
+        .setColor(0x0079bf)
+        .setTitle('✅ タスクが追加されました')
+        .addFields(
+            { name: 'タイトル', value: title, inline: false },
+            { name: '説明', value: description || 'なし', inline: false },
+            { name: 'リスト', value: listName, inline: false },
+            { name: 'Trelloリンク', value: `[カードを開く](${card.shortUrl})`, inline: false }
+        )
+        .setTimestamp();
+    
+    await interaction.editReply({ embeds: [embed] });
+}
+
 // スラッシュコマンドの処理
 client.on('interactionCreate', async interaction => {
     // オートコンプリートの処理
@@ -353,6 +456,9 @@ client.on('interactionCreate', async interaction => {
 
     try {
         switch (commandName) {
+            case 'add-task':
+                await handleAddTask(interaction, options);
+                break;
             case 'list-tasks':
                 await handleListTasks(interaction, options);
                 break;
@@ -367,7 +473,7 @@ client.on('interactionCreate', async interaction => {
                 await handleIdeaCommand(interaction, options);
                 break;
             case 'spec':
-                await handleWorkflowMove(interaction, options, '決定要件');
+                await handleSpecCommand(interaction, options);
                 break;
             case 'todo':
                 await handleWorkflowMove(interaction, options, '今回改修');
@@ -618,6 +724,58 @@ async function handleWorkflowMove(interaction, options, targetListName) {
         .setTimestamp();
     
     await interaction.editReply({ embeds: [embed] });
+}
+
+// /spec コマンド専用処理（GitHub連携付き）
+async function handleSpecCommand(interaction, options) {
+    await interaction.deferReply();
+    
+    const title = options.getString('title');
+    const targetListName = '決定要件';
+    const targetListId = LISTS[targetListName];
+    
+    try {
+        // 1. Trello処理（既存と同じ）
+        const allCards = await taskCache.getAllCards();
+        const targetCard = allCards.find(card => 
+            card.name.toLowerCase().includes(title.toLowerCase())
+        );
+        
+        if (!targetCard) {
+            await interaction.editReply(`「${title}」に一致するタスクが見つかりませんでした。`);
+            return;
+        }
+        
+        await TrelloAPI.moveCard(targetCard.id, targetListId);
+        taskCache.clear();
+        
+        // 2. GitHub Planning Issue作成（新機能）
+        let githubResult = '';
+        try {
+            const planningIssue = await GitHubAPI.createPlanningIssue(targetCard);
+            githubResult = `\n🐙 **GitHub**: Planning Issue #${planningIssue.number} を作成\n🔗 ${planningIssue.html_url}`;
+        } catch (error) {
+            console.error('GitHub連携エラー:', error);
+            githubResult = '\n⚠️ **GitHub**: Issue作成に失敗しました';
+        }
+        
+        // 3. 結果表示
+        const embed = new EmbedBuilder()
+            .setColor(0x2196f3)
+            .setTitle('📋 要件決定完了！')
+            .addFields(
+                { name: 'タスク', value: targetCard.name, inline: false },
+                { name: 'Trello', value: `「${targetCard.listName}」→「${targetListName}」に移動`, inline: false }
+            )
+            .setDescription(githubResult)
+            .setTimestamp();
+        
+        await interaction.editReply({ embeds: [embed] });
+        
+    } catch (error) {
+        console.error('/spec コマンドエラー:', error);
+        await interaction.editReply('処理中にエラーが発生しました。');
+    }
 }
 
 // リアクションでタスク追加
