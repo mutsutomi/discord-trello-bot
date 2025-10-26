@@ -1,38 +1,64 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+const { Pool } = require('pg');
 
-// データベースパス（環境変数から取得、デフォルトは./articles.db）
-const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, '..', 'articles.db');
+// PostgreSQL接続プール
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
-// データベース接続
-let db = null;
+// 接続エラーハンドリング
+pool.on('error', (err) => {
+    console.error('❌ PostgreSQL接続エラー:', err);
+});
 
 /**
- * データベースを初期化
+ * データベース接続をテスト
  */
-function initializeDatabase() {
+async function testDatabaseConnection() {
     try {
-        db = new Database(DB_PATH);
+        const result = await pool.query('SELECT NOW()');
+        console.log('✅ データベース接続成功:', result.rows[0].now);
+        return true;
+    } catch (error) {
+        console.error('❌ データベース接続失敗:', error);
+        throw error;
+    }
+}
 
+/**
+ * データベースを初期化（テーブル作成）
+ */
+async function initializeDatabase() {
+    try {
         // articlesテーブルの作成
-        db.exec(`
+        await pool.query(`
             CREATE TABLE IF NOT EXISTS articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 url TEXT UNIQUE NOT NULL,
                 title TEXT,
                 description TEXT,
-                tags TEXT,
-                category TEXT,
-                posted_by TEXT,
-                posted_at TEXT NOT NULL,
+                tags JSONB,
+                category TEXT CHECK (category IN ('frontend', 'backend', 'infra', 'design', 'other')),
+                posted_by TEXT NOT NULL,
+                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 discord_message_id TEXT,
                 thumbnail TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
 
-        console.log('✅ データベースが初期化されました:', DB_PATH);
-        return db;
+        // インデックスの作成
+        await pool.query('CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)');
+        await pool.query('CREATE INDEX IF NOT EXISTS idx_articles_tags ON articles USING GIN(tags)');
+        await pool.query('CREATE INDEX IF NOT EXISTS idx_articles_posted_at ON articles(posted_at DESC)');
+
+        console.log('✅ データベースが初期化されました');
+
+        // 接続テスト
+        await testDatabaseConnection();
+
+        return pool;
     } catch (error) {
         console.error('❌ データベース初期化エラー:', error);
         throw error;
@@ -42,35 +68,43 @@ function initializeDatabase() {
 /**
  * 記事を保存
  * @param {Object} article - 記事データ
- * @returns {Object} 保存された記事データ
+ * @returns {Promise<Object>} 保存された記事データ
  */
-function saveArticle(article) {
+async function saveArticle(article) {
     try {
-        const stmt = db.prepare(`
+        const query = `
             INSERT INTO articles (
                 url, title, description, tags, category,
                 posted_by, posted_at, discord_message_id, thumbnail
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (url) DO NOTHING
+            RETURNING *
+        `;
 
-        const info = stmt.run(
+        const values = [
             article.url,
             article.title,
             article.description,
             JSON.stringify(article.tags || []),
             article.category,
             article.posted_by,
-            article.posted_at,
+            article.posted_at || new Date().toISOString(),
             article.discord_message_id,
             article.thumbnail
-        );
+        ];
+
+        const result = await pool.query(query, values);
+
+        if (result.rows.length === 0) {
+            throw new Error('この記事は既に保存されています');
+        }
 
         console.log('✅ 記事を保存しました:', article.title);
-        return { id: info.lastInsertRowid, ...article };
+        return result.rows[0];
     } catch (error) {
-        if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-            throw new Error('この記事は既に保存されています');
+        if (error.message.includes('既に保存されています')) {
+            throw error;
         }
         console.error('❌ 記事保存エラー:', error);
         throw error;
@@ -80,18 +114,18 @@ function saveArticle(article) {
 /**
  * URLで記事を検索
  * @param {string} url - 検索するURL
- * @returns {Object|null} 記事データ
+ * @returns {Promise<Object|null>} 記事データ
  */
-function findArticleByUrl(url) {
+async function findArticleByUrl(url) {
     try {
-        const stmt = db.prepare('SELECT * FROM articles WHERE url = ?');
-        const article = stmt.get(url);
+        const query = 'SELECT * FROM articles WHERE url = $1';
+        const result = await pool.query(query, [url]);
 
-        if (article && article.tags) {
-            article.tags = JSON.parse(article.tags);
+        if (result.rows.length === 0) {
+            return null;
         }
 
-        return article;
+        return result.rows[0];
     } catch (error) {
         console.error('❌ 記事検索エラー:', error);
         throw error;
@@ -102,24 +136,19 @@ function findArticleByUrl(url) {
  * キーワードで記事を検索
  * @param {string} keyword - 検索キーワード
  * @param {number} limit - 取得件数
- * @returns {Array} 記事データの配列
+ * @returns {Promise<Array>} 記事データの配列
  */
-function searchArticles(keyword, limit = 10) {
+async function searchArticles(keyword, limit = 10) {
     try {
-        const stmt = db.prepare(`
+        const query = `
             SELECT * FROM articles
-            WHERE title LIKE ? OR description LIKE ? OR tags LIKE ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        `);
+            WHERE title ILIKE $1 OR description ILIKE $1
+            ORDER BY posted_at DESC
+            LIMIT $2
+        `;
 
-        const searchPattern = `%${keyword}%`;
-        const articles = stmt.all(searchPattern, searchPattern, searchPattern, limit);
-
-        return articles.map(article => ({
-            ...article,
-            tags: article.tags ? JSON.parse(article.tags) : []
-        }));
+        const result = await pool.query(query, [`%${keyword}%`, limit]);
+        return result.rows;
     } catch (error) {
         console.error('❌ 記事検索エラー:', error);
         throw error;
@@ -130,23 +159,19 @@ function searchArticles(keyword, limit = 10) {
  * タグで記事を検索
  * @param {string} tag - タグ名
  * @param {number} limit - 取得件数
- * @returns {Array} 記事データの配列
+ * @returns {Promise<Array>} 記事データの配列
  */
-function findArticlesByTag(tag, limit = 10) {
+async function findArticlesByTag(tag, limit = 10) {
     try {
-        const stmt = db.prepare(`
+        const query = `
             SELECT * FROM articles
-            WHERE tags LIKE ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        `);
+            WHERE tags @> $1
+            ORDER BY posted_at DESC
+            LIMIT $2
+        `;
 
-        const articles = stmt.all(`%"${tag}"%`, limit);
-
-        return articles.map(article => ({
-            ...article,
-            tags: article.tags ? JSON.parse(article.tags) : []
-        }));
+        const result = await pool.query(query, [JSON.stringify([tag]), limit]);
+        return result.rows;
     } catch (error) {
         console.error('❌ タグ検索エラー:', error);
         throw error;
@@ -157,23 +182,19 @@ function findArticlesByTag(tag, limit = 10) {
  * カテゴリで記事を検索
  * @param {string} category - カテゴリ名
  * @param {number} limit - 取得件数
- * @returns {Array} 記事データの配列
+ * @returns {Promise<Array>} 記事データの配列
  */
-function findArticlesByCategory(category, limit = 10) {
+async function findArticlesByCategory(category, limit = 10) {
     try {
-        const stmt = db.prepare(`
+        const query = `
             SELECT * FROM articles
-            WHERE category = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        `);
+            WHERE category = $1
+            ORDER BY posted_at DESC
+            LIMIT $2
+        `;
 
-        const articles = stmt.all(category, limit);
-
-        return articles.map(article => ({
-            ...article,
-            tags: article.tags ? JSON.parse(article.tags) : []
-        }));
+        const result = await pool.query(query, [category, limit]);
+        return result.rows;
     } catch (error) {
         console.error('❌ カテゴリ検索エラー:', error);
         throw error;
@@ -183,22 +204,18 @@ function findArticlesByCategory(category, limit = 10) {
 /**
  * 最新記事を取得
  * @param {number} limit - 取得件数
- * @returns {Array} 記事データの配列
+ * @returns {Promise<Array>} 記事データの配列
  */
-function getRecentArticles(limit = 10) {
+async function getRecentArticles(limit = 10) {
     try {
-        const stmt = db.prepare(`
+        const query = `
             SELECT * FROM articles
-            ORDER BY created_at DESC
-            LIMIT ?
-        `);
+            ORDER BY posted_at DESC
+            LIMIT $1
+        `;
 
-        const articles = stmt.all(limit);
-
-        return articles.map(article => ({
-            ...article,
-            tags: article.tags ? JSON.parse(article.tags) : []
-        }));
+        const result = await pool.query(query, [limit]);
+        return result.rows;
     } catch (error) {
         console.error('❌ 最新記事取得エラー:', error);
         throw error;
@@ -206,28 +223,29 @@ function getRecentArticles(limit = 10) {
 }
 
 /**
- * データベース接続を取得
- * @returns {Database} データベースインスタンス
+ * データベース接続プールを取得
+ * @returns {Pool} データベース接続プール
  */
 function getDatabase() {
-    if (!db) {
-        initializeDatabase();
-    }
-    return db;
+    return pool;
 }
 
 /**
- * データベースを閉じる
+ * データベース接続を閉じる
  */
-function closeDatabase() {
-    if (db) {
-        db.close();
+async function closeDatabase() {
+    try {
+        await pool.end();
         console.log('✅ データベース接続を閉じました');
+    } catch (error) {
+        console.error('❌ データベース接続終了エラー:', error);
+        throw error;
     }
 }
 
 module.exports = {
     initializeDatabase,
+    testDatabaseConnection,
     saveArticle,
     findArticleByUrl,
     searchArticles,

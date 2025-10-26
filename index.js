@@ -859,5 +859,33 @@ process.on('unhandledRejection', error => {
     console.error('未処理のPromise拒否:', error);
 });
 
+// グレースフルシャットダウン
+process.on('SIGTERM', async () => {
+    console.log('SIGTERM受信、接続を閉じています...');
+    try {
+        const { closeDatabase } = require('./utils/database');
+        await closeDatabase();
+        client.destroy();
+        process.exit(0);
+    } catch (error) {
+        console.error('シャットダウンエラー:', error);
+        process.exit(1);
+    }
+});
+
+process.on('SIGINT', async () => {
+    console.log('\nSIGINT受信、接続を閉じています...');
+    try {
+        const { closeDatabase } = require('./utils/database');
+        await closeDatabase();
+        client.destroy();
+        process.exit(0);
+    } catch (error) {
+        console.error('シャットダウンエラー:', error);
+        process.exit(1);
+    }
+});
+
 // ボットを起動
+console.log('Bot is starting...');
 client.login(DISCORD_TOKEN);

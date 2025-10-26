@@ -1,23 +1,26 @@
 {
   "name": "discord-trello-bot",
   "version": "1.0.0",
-  "description": "",
+  "description": "Discord bot for managing tasks with Trello and technical articles with automatic classification",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["discord", "bot", "trello", "article", "management"],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.67.0",
     "@octokit/rest": "^22.0.0",
     "axios": "^1.10.0",
-    "better-sqlite3": "^12.4.1",
     "discord.js": "^14.21.0",
     "dotenv": "^17.2.0",
-    "open-graph-scraper": "^6.10.0"
+    "open-graph-scraper": "^6.10.0",
+    "pg": "^8.16.3"
   }
 }
