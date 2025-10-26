@@ -3,6 +3,12 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require
 const axios = require('axios');
 const { Octokit } = require('@octokit/rest');
 
+// 記事管理機能のインポート
+const { initializeDatabase } = require('./utils/database');
+const { initializeClaudeClient } = require('./utils/claudeClassifier');
+const { handleMessage } = require('./handlers/messageHandler');
+const { handleReactionAdd } = require('./handlers/reactionHandler');
+
 // 設定値（環境変数から読み込み）
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
@@ -16,6 +22,8 @@ const GITHUB_REPO_DEFAULT = 'mahoroba-planning';
 const GITHUB_REPO_FRONT = 'mahoroba-ios';
 const GITHUB_REPO_BACK = 'mahoroba-api';
 const GITHUB_REPO_WEB = 'mahoroba-web';
+// 記事管理機能設定
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // Trelloリスト定義
 const LISTS = {
@@ -334,7 +342,7 @@ const commands = [
 // ボット起動時の処理
 client.once('ready', async () => {
     console.log(`${client.user.tag} がログインしました！`);
-    
+
     // スラッシュコマンドを登録
     try {
         console.log('スラッシュコマンドを登録中...');
@@ -342,6 +350,20 @@ client.once('ready', async () => {
         console.log('スラッシュコマンドの登録が完了しました');
     } catch (error) {
         console.error('スラッシュコマンドの登録に失敗:', error);
+    }
+
+    // 記事管理機能を初期化
+    try {
+        console.log('記事管理機能を初期化中...');
+        initializeDatabase();
+        if (ANTHROPIC_API_KEY && ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here') {
+            initializeClaudeClient(ANTHROPIC_API_KEY);
+            console.log('✅ 記事管理機能の初期化が完了しました');
+        } else {
+            console.warn('⚠️  ANTHROPIC_API_KEY が設定されていません。記事の自動分類は無効です。');
+        }
+    } catch (error) {
+        console.error('記事管理機能の初期化に失敗:', error);
     }
 });
 
@@ -778,35 +800,47 @@ async function handleSpecCommand(interaction, options) {
     }
 }
 
+// メッセージ受信時の処理（記事管理機能）
+client.on('messageCreate', async (message) => {
+    try {
+        await handleMessage(message);
+    } catch (error) {
+        console.error('メッセージ処理エラー:', error);
+    }
+});
+
 // リアクションでタスク追加
 client.on('messageReactionAdd', async (reaction, user) => {
     // ボット自身のリアクションは無視
     if (user.bot) return;
-    
-    // 📋 絵文字の場合のみ処理
+
+    // 記事管理機能のリアクション処理
+    await handleReactionAdd(reaction, user);
+
+    // 📋 絵文字の場合のみ処理（既存のTrello機能）
     if (reaction.emoji.name === '📋') {
         try {
             const message = reaction.message;
-            
+
             // メッセージからタイトルを生成（最大50文字に制限）
             let title = message.content.trim();
             if (title.length > 50) {
                 title = title.substring(0, 47) + '...';
             }
-            
+
             // メッセージが空の場合のフォールバック
             if (!title) {
                 title = `${user.username}からのタスク`;
             }
-            
+
             const description = `📋 ${user.username}さんがリアクションで追加\n\n元メッセージ: ${message.content}\n送信者: ${message.author.username}\nチャンネル: ${message.channel.name}`;
-            
+
             // デフォルトで「アイデア」リストに追加
             await TrelloAPI.createCard(title, description, LISTS['アイデア']);
-            
+
             // タスクが追加されたのでキャッシュをクリア
             taskCache.clear();
-            
+
             // 確認メッセージを送信
             await message.reply(`📋 ${user.username}さん、「${title}」を「アイデア」リストのタスクとして追加しました！`);
         } catch (error) {
